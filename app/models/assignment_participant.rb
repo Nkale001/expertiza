@@ -10,6 +10,7 @@ require 'yaml'
 
 class AssignmentParticipant < Participant
   require 'wiki_helper'
+  include FileHelper
 
   belongs_to  :assignment, :class_name => 'Assignment', :foreign_key => 'parent_id'
   has_many    :review_mappings, :class_name => 'ReviewResponseMap', :foreign_key => 'reviewee_id'
@@ -46,9 +47,7 @@ class AssignmentParticipant < Participant
     (((sum_of_scores.to_f / number_of_scores.to_f) * 100).to_i) / 100.0
   end
 
-  def dir_path
-    assignment.try :directory_path
-  end
+
 
   # Returns the average score of all reviews for this user on this assignment
   def average_score
@@ -58,20 +57,6 @@ class AssignmentParticipant < Participant
 
     self.response_maps.each do |response_map|
       if !response_map.response.empty?  then
-        sum_of_scores = sum_of_scores + response_map.response.last.average_score
-      end
-    end
-
-    (sum_of_scores / self.response_maps.size).to_i
-  end
-
-  def average_score_per_assignment(assignment_id)
-    return 0 if self.response_maps.size == 0
-
-    sum_of_scores = 0
-
-    self.response_maps.metareview_response_maps.each do |metaresponse_map|
-      if !metaresponse_map.response.empty? && response_map == assignment_id then
         sum_of_scores = sum_of_scores + response_map.response.last.average_score
       end
     end
@@ -114,29 +99,10 @@ class AssignmentParticipant < Participant
   ##  ReviewResponseMap.where(['reviewee_id = ? && reviewer_id = ? && reviewed_object_id = ?', team_id, reviewer.id, assignment.id]).count > 0
   #end
 
-  def quiz_taken_by?(contributor, reviewer)
-    quiz_id = QuizQuestionnaire.find_by_instructor_id(contributor.id)
-    return QuizResponseMap.where(['reviewee_id = ? AND reviewer_id = ? AND reviewed_object_id = ?',
-                                  self.id, reviewer.id, quiz_id]).count > 0
-  end
-
   def has_submissions?
     return ((submitted_files.length > 0) or
             (wiki_submissions.length > 0) or
             (hyperlinks_array.length > 0))
-  end
-
-  def has_quiz?
-    return !QuizQuestionnaire.find_by_instructor_id(self.id).nil?
-  end
-
-  # all the participants in this assignment reviewed by this person
-  def reviewees
-    reviewees = []
-    rmaps = ResponseMap.all(conditions: ["reviewer_id = #{self.id} && type = 'ReviewResponseMap'"])
-        rmaps.each { |rm| reviewees.concat(AssignmentTeam.find(rm.reviewee_id).participants) }
-
-    reviewees
   end
 
   # all the participants in this assignment who have reviewed this person
@@ -148,89 +114,6 @@ class AssignmentParticipant < Participant
     end
 
     reviewers
-  end
- 
-
-  # Cycle data structure
-  # Each edge of the cycle stores a participant and the score given to the participant by the reviewer.
-  # Consider a 3 node cycle: A --> B --> C --> A (A reviewed B; B reviewed C and C reviewed A)
-  # For the above cycle, the data structure would be: [[A, SCA], [B, SAB], [C, SCB]], where SCA is the score given by C to A.
-
-  def two_node_cycles
-    cycles = []
-    self.reviewers.each do |ap|
-      if ap.reviewers.include?(self)
-        self.reviews_by_reviewer(ap).nil? ? next : s01 = self.reviews_by_reviewer(ap).get_total_score
-        ap.reviews_by_reviewer(self).nil? ? next : s10 = ap.reviews_by_reviewer(self).get_total_score
-        cycles.push([[self, s01], [ap, s10]])
-      end
-    end
-    cycles
-  end
-
-
-  def three_node_cycles
-    cycles = []
-    self.reviewers.each do |ap1|
-      ap1.reviewers.each do |ap2|
-        if ap2.reviewers.include?(self)
-          self.reviews_by_reviewer(ap1).nil? ? next : s01 = self.reviews_by_reviewer(ap1).get_total_score
-          ap1.reviews_by_reviewer(ap2).nil? ? next : s12 = ap1.reviews_by_reviewer(ap2).get_total_score
-          ap2.reviews_by_reviewer(self).nil? ? next : s20 = ap2.reviews_by_reviewer(self).get_total_score
-          cycles.push([[self, s01], [ap1, s12], [ap2, s20]])
-        end
-      end
-    end
-    cycles
-  end
-
-  def four_node_cycles
-    cycles = []
-    self.reviewers.each do |ap1|
-      ap1.reviewers.each do |ap2|
-        ap2.reviewers.each do |ap3|
-          if ap3.reviewers.include?(self)
-            self.reviews_by_reviewer(ap1).nil? ? next : s01 = self.reviews_by_reviewer(ap1).get_total_score
-            ap1.reviews_by_reviewer(ap2).nil? ? next : s12 = ap1.reviews_by_reviewer(ap2).get_total_score
-            ap2.reviews_by_reviewer(ap3).nil? ? next : s23 = ap2.reviews_by_reviewer(ap3).get_total_score
-            ap3.reviews_by_reviewer(self).nil? ? next : s30 = ap3.reviews_by_reviewer(self).get_total_score
-            cycles.push([[self, s01], [ap1, s12], [ap2, s23], [ap3, s30]])
-          end
-        end
-      end
-    end
-    cycles
-  end
-
-  # Per cycle
-  def cycle_similarity_score(cycle)
-    similarity_score = 0.0
-    count = 0.0
-
-    0 ... cycle.size-1.each do |pivot|
-      pivot_score = cycle[pivot][1]
-      similarity_score = similarity_score + (pivot_score - cycle[other][1]).abs
-      count = count + 1.0
-    end
-
-    similarity_score = similarity_score / count unless count == 0.0
-    similarity_score
-  end
-
-  # Per cycle
-  def cycle_deviation_score(cycle)
-    deviation_score = 0.0
-    count = 0.0
-
-    0 ... cycle.size.each do |member|
-      participant = AssignmentParticipant.find(cycle[member][0].id)
-      total_score = participant.get_review_score
-      deviation_score = deviation_score + (total_score - cycle[member][1]).abs
-      count = count + 1.0
-    end
-
-    deviation_score = deviation_score / count unless count == 0.0
-    deviation_score
   end
 
   def review_score
@@ -251,6 +134,42 @@ class AssignmentParticipant < Participant
   def scores(questions)
     scores = {}
     scores[:participant] = self
+
+    assignment_questionnaires(questions, scores)
+
+    scores[:total_score] = self.assignment.compute_total_score(scores)
+
+    merge_scores(scores)
+
+    # In the event that this is a microtask, we need to scale the score accordingly and record the total possible points
+    # PS: I don't like the fact that we are doing this here but it is difficult to make it work anywhere else
+    if assignment.is_microtask?
+      topic = SignUpTopic.find_by_assignment_id(assignment.id)
+      if !topic.nil?
+        scores[:total_score] *= (topic.micropayment.to_f / 100.to_f)
+        scores[:max_pts_available] = topic.micropayment
+      end
+    end
+
+    # for all quiz questionnaires (quizzes) taken by the participant
+    quiz_responses = Array.new
+    quiz_response_mappings = QuizResponseMap.where(reviewer_id: self.id)
+    quiz_response_mappings.each do |qmapping|
+      if (qmapping.response)
+        quiz_responses << qmapping.response
+      end
+    end
+    #scores[:quiz] = Hash.new
+    #scores[:quiz][:assessments] = quiz_responses
+    #scores[:quiz][:scores] = Answer.compute_quiz_scores(scores[:quiz][:assessments])
+
+    scores[:total_score] = assignment.compute_total_score(scores)
+    #scores[:total_score] += compute_quiz_scores(scores)
+
+    calculate_scores(scores)
+  end
+
+  def assignment_questionnaires(questions, scores)
     self.assignment.questionnaires.each do |questionnaire|
       round = AssignmentQuestionnaire.find_by_assignment_id_and_questionnaire_id(self.assignment.id, questionnaire.id).used_in_round
       #create symbol for "varying rubrics" feature -Yang
@@ -269,9 +188,9 @@ class AssignmentParticipant < Participant
       end
       scores[questionnaire_symbol][:scores] = Answer.compute_scores(scores[questionnaire_symbol][:assessments], questions[questionnaire_symbol])
     end
+  end
 
-    scores[:total_score] = self.assignment.compute_total_score(scores)
-
+  def merge_scores(scores)
     #merge scores[review#] (for each round) to score[review]  -Yang
     if self.assignment.varying_rubrics_by_round?
       review_sym = "review".to_sym
@@ -303,38 +222,15 @@ class AssignmentParticipant < Participant
       end
 
       if scores[review_sym][:scores][:max] == -999999999 && scores[review_sym][:scores][:min] == 999999999
-               scores[review_sym][:scores][:max] = 0
-               scores[review_sym][:scores][:min] = 0
+        scores[review_sym][:scores][:max] = 0
+        scores[review_sym][:scores][:min] = 0
       end
 
       scores[review_sym][:scores][:avg] = total_score/scores[review_sym][:assessments].length.to_f
     end
+  end
 
-    # In the event that this is a microtask, we need to scale the score accordingly and record the total possible points
-    # PS: I don't like the fact that we are doing this here but it is difficult to make it work anywhere else
-    if assignment.is_microtask?
-      topic = SignUpTopic.find_by_assignment_id(assignment.id)
-      if !topic.nil?
-        scores[:total_score] *= (topic.micropayment.to_f / 100.to_f)
-        scores[:max_pts_available] = topic.micropayment
-      end
-    end
-
-    # for all quiz questionnaires (quizzes) taken by the participant
-    quiz_responses = Array.new
-    quiz_response_mappings = QuizResponseMap.where(reviewer_id: self.id)
-    quiz_response_mappings.each do |qmapping|
-      if (qmapping.response)
-        quiz_responses << qmapping.response
-      end
-    end
-    #scores[:quiz] = Hash.new
-    #scores[:quiz][:assessments] = quiz_responses
-    #scores[:quiz][:scores] = Answer.compute_quiz_scores(scores[:quiz][:assessments])
-
-    scores[:total_score] = assignment.compute_total_score(scores)
-    #scores[:total_score] += compute_quiz_scores(scores)
-
+  def calculate_scores(scores)
     # move lots of calculation from view(_participant.html.erb) to model
     if self.grade
       scores[:total_score] = self.grade
@@ -344,18 +240,8 @@ class AssignmentParticipant < Participant
         total_score = 100
       end
       scores[:total_score] = total_score
-    scores
+      scores
     end
-  end
-
-  def compute_quiz_scores(scores)
-    total = 0
-    if scores[:quiz][:scores][:avg]
-      return scores[:quiz][:scores][:avg] * 100  / 100.to_f
-    else
-      return 0
-    end
-    return total
   end
   # Appends the hyperlink to a list that is stored in YAML format in the DB
   # @exception  If is hyperlink was already there
@@ -381,14 +267,10 @@ class AssignmentParticipant < Participant
     self.save
   end
 
-  def members
-    team.try :participants
-  end
-
   def hyperlinks
     team.try(:hyperlinks) || []
   end
- 
+
   def hyperlinks_array
     self.submitted_hyperlinks.blank? ? [] : YAML::load(self.submitted_hyperlinks)
   end
@@ -426,7 +308,7 @@ class AssignmentParticipant < Participant
   def reviews_by_reviewer(reviewer)
     ReviewResponseMap.get_reviewer_assessments_for(self.team, reviewer)
   end
-  
+
   # def get_reviews
   #   self.response_maps
   # end
@@ -440,40 +322,12 @@ class AssignmentParticipant < Participant
     MetareviewResponseMap.get_assessments_for(self)
   end
 
-
+# Commenting as we cannot figure out any difference in UI Test
+=begin
   def teammate_reviews
     TeammateReviewResponseMap.get_assessments_for(self)
   end
-
-  def bookmark_reviews
-    BookmarkRatingResponseMap.get_assessments_for(self)
-  end
-
-  def submitted_files
-    files(self.path) if self.directory_num
-  end
-
-  def files(directory)
-    files_list = Dir[directory + "/*"]
-    files = Array.new
-
-    files_list.each do |file|
-      if File.directory?(file)
-        dir_files = files(file)
-        dir_files.each{|f| files << f}
-      end
-      files << file
-    end
-    files
-  end
-
-  def submitted_files()
-    files = Array.new
-    if(self.directory_num)
-      files = files(self.path)
-    end
-    return files
-  end
+=end
 
   def wiki_submissions
     current_time = Time.now.month.to_s + "/" + Time.now.day.to_s + "/" + Time.now.year.to_s
@@ -538,17 +392,6 @@ class AssignmentParticipant < Participant
     ["name","full name","email","role","parent","email on submission","email on review","email on metareview","handle"]
   end
 
-  # generate a hash string that we can digitally sign, consisting of the
-  # assignment name, user name, and time stamp passed in.
-  def get_hash(time_stamp)
-    # first generate a hash from the assignment name itself
-    hash_data = Digest::SHA1.digest(self.assignment.name.to_s)
-
-    # second generate a hash from the first hash plus the user name and time stamp
-    sign = hash_data + self.user.name.to_s + time_stamp.strftime("%Y-%m-%d %H:%M:%S")
-    Digest::SHA1.digest(sign)
-  end
-
   # grant publishing rights to one or more assignments. Using the supplied private key,
   # digital signatures are generated.
   # reference: http://stuff-things.net/2008/02/05/encrypting-lots-of-sensitive-data-with-ruby-on-rails/
@@ -568,9 +411,7 @@ class AssignmentParticipant < Participant
 
     #define a handle for a new participant
     def set_handle
-      if self.user.handle == nil or self.user.handle == ""
-        self.handle = self.user.name
-      elsif AssignmentParticipant.where(parent_id: self.assignment.id, handle: self.user.handle).length > 0
+      if self.user.handle == nil or self.user.handle == "" or AssignmentParticipant.where(parent_id: self.assignment.id, handle: self.user.handle).length > 0
         self.handle = self.user.name
       else
         self.handle = self.user.handle
@@ -645,6 +486,7 @@ class AssignmentParticipant < Participant
       topic_id = SignedUpTeam.topic_id(self.parent_id, self.user_id)
       assignment.stage_deadline topic_id
     end
+
 
 
     def review_response_maps
